@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import { createWorker, OEM, PSM } from 'tesseract.js'
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
 
 GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -12,6 +13,21 @@ type OemOption = {
   label: string
   value: OEM
   description: string
+}
+
+type OcrWord = {
+  text: string
+  bbox: {
+    x0: number
+    y0: number
+    x1: number
+    y1: number
+  }
+}
+
+type OcrPageResult = {
+  imageDataUrl: string
+  words: OcrWord[]
 }
 
 const oemOptions: OemOption[] = [
@@ -108,6 +124,27 @@ function imageFileToDataUrl(file: File): Promise<string> {
   })
 }
 
+function getImageDimensions(imageDataUrl: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight })
+    img.onerror = () => reject(new Error('Nao foi possivel carregar a imagem para exportar o PDF.'))
+    img.src = imageDataUrl
+  })
+}
+
+async function embedImageFromDataUrl(pdfDoc: PDFDocument, imageDataUrl: string) {
+  if (imageDataUrl.startsWith('data:image/png')) {
+    return pdfDoc.embedPng(imageDataUrl)
+  }
+
+  if (imageDataUrl.startsWith('data:image/jpeg') || imageDataUrl.startsWith('data:image/jpg')) {
+    return pdfDoc.embedJpg(imageDataUrl)
+  }
+
+  throw new Error('Formato de imagem nao suportado para exportacao em PDF.')
+}
+
 async function videoToFrameDataUrls(
   file: File,
   frameIntervalSeconds = 1,
@@ -171,6 +208,7 @@ function App() {
   const [currentPage, setCurrentPage] = useState(0)
   const [totalPages, setTotalPages] = useState(0)
   const [resultText, setResultText] = useState('')
+  const [ocrPages, setOcrPages] = useState<OcrPageResult[]>([])
   const [error, setError] = useState('')
 
   const progressLabel = useMemo(() => `${Math.round(pageProgress * 100)}%`, [pageProgress])
@@ -213,6 +251,7 @@ function App() {
     setTotalPages(0)
     setError('')
     setResultText('')
+    setOcrPages([])
 
     const worker = await createWorker(language, oem, {
       logger: (message) => {
@@ -241,23 +280,95 @@ function App() {
 
       setTotalPages(images.length)
       const textByPage: string[] = []
+      const pagesForPdf: OcrPageResult[] = []
 
       for (let i = 0; i < images.length; i += 1) {
         setCurrentPage(i + 1)
         setPageProgress(0)
         const { data } = await worker.recognize(images[i])
+        const ocrData = data as typeof data & { words?: OcrWord[] }
         setPageProgress(1)
         const sectionName = file.type.startsWith('video/') ? 'Frame' : 'Pagina'
         textByPage.push(`--- ${sectionName} ${i + 1} ---\n${data.text.trim()}`)
+        pagesForPdf.push({
+          imageDataUrl: images[i],
+          words: (ocrData.words ?? []).map((word) => ({
+            text: word.text,
+            bbox: word.bbox,
+          })),
+        })
       }
 
       setResultText(textByPage.join('\n\n'))
+      setOcrPages(pagesForPdf)
     } catch (ocrError) {
       console.error(ocrError)
       setError('Falha ao processar o OCR. Verifique se o arquivo e valido.')
     } finally {
       await worker.terminate()
       setIsProcessing(false)
+    }
+  }
+
+  const downloadPdfWithOcr = async () => {
+    if (!ocrPages.length || !file) {
+      setError('Gere o OCR antes de baixar o PDF.')
+      return
+    }
+
+    setError('')
+
+    try {
+      const pdfDoc = await PDFDocument.create()
+      const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
+
+      for (const pageData of ocrPages) {
+        const { width, height } = await getImageDimensions(pageData.imageDataUrl)
+        const embeddedImage = await embedImageFromDataUrl(pdfDoc, pageData.imageDataUrl)
+        const page = pdfDoc.addPage([width, height])
+
+        page.drawImage(embeddedImage, {
+          x: 0,
+          y: 0,
+          width,
+          height,
+        })
+
+        for (const word of pageData.words) {
+          const cleanedText = word.text?.trim()
+          if (!cleanedText) continue
+
+          const wordWidth = Math.max(1, word.bbox.x1 - word.bbox.x0)
+          const wordHeight = Math.max(1, word.bbox.y1 - word.bbox.y0)
+          const fontSize = Math.max(6, wordHeight)
+          const y = height - word.bbox.y1
+
+          page.drawText(cleanedText, {
+            x: word.bbox.x0,
+            y,
+            size: fontSize,
+            font,
+            color: rgb(0, 0, 0),
+            opacity: 0,
+            lineHeight: fontSize,
+            maxWidth: wordWidth,
+          })
+        }
+      }
+
+      const pdfBytes = await pdfDoc.save()
+      const pdfBlob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' })
+      const downloadUrl = URL.createObjectURL(pdfBlob)
+      const anchor = document.createElement('a')
+      const fileNameWithoutExtension = file.name.replace(/\.[^/.]+$/, '')
+
+      anchor.href = downloadUrl
+      anchor.download = `${fileNameWithoutExtension || 'documento'}-ocr.pdf`
+      anchor.click()
+      URL.revokeObjectURL(downloadUrl)
+    } catch (downloadError) {
+      console.error(downloadError)
+      setError('Nao foi possivel gerar o PDF com OCR.')
     }
   }
 
@@ -350,16 +461,27 @@ function App() {
           </label>
         </div>
 
-        <button
-          type="button"
-          onClick={generateOcr}
-          disabled={isProcessing}
-          className="mt-6 inline-flex items-center rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {isProcessing
-            ? `Gerando OCR (Pagina ${Math.max(currentPage, 1)}/${Math.max(totalPages, 1)} - ${progressLabel})...`
-            : 'Gerar OCR'}
-        </button>
+        <div className="mt-6 flex flex-wrap gap-3">
+          <button
+            type="button"
+            onClick={generateOcr}
+            disabled={isProcessing}
+            className="inline-flex items-center rounded-xl bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isProcessing
+              ? `Gerando OCR (Pagina ${Math.max(currentPage, 1)}/${Math.max(totalPages, 1)} - ${progressLabel})...`
+              : 'Gerar OCR'}
+          </button>
+
+          <button
+            type="button"
+            onClick={downloadPdfWithOcr}
+            disabled={isProcessing || !ocrPages.length}
+            className="inline-flex items-center rounded-xl border border-slate-300 bg-white px-5 py-3 text-sm font-semibold text-slate-800 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Baixar PDF com OCR
+          </button>
+        </div>
 
         {error ? <p className="mt-4 text-sm font-medium text-red-600">{error}</p> : null}
 
